@@ -1,0 +1,650 @@
+---
+title: "CAREER Isotope Wrapping Selector"
+author: "Herbert Leavitt"
+date: "2024-11-15"
+output: html_document
+---
+
+```{r}
+# Load essential libraries for data manipulation, spatial operations, and reading Excel/Google Sheets
+library(tidyverse)   # dplyr, ggplot2, and related packages
+library(sf)          # Simple Features for geospatial data handling
+library(readxl)      # Read Excel files
+library(gsheet)      # Read data directly from Google Sheets
+# Set the working directory for relative file paths throughout this script
+knitr::opts_knit$set(root.dir = "C:/Users/hl51981/OneDrive - University of Georgia/Leavitt_Herbert/PFFW/Pt Fourchon Food Webs R Directory/isotope_workflow/sample_selection/selected samples")
+```
+
+```{r import data }
+
+# -------------------------------------------
+# IMPORT AND PREPARE DATA FROM SHAREPOINT
+# -------------------------------------------
+
+# Base path to the local  folder
+sharepoint_path <- "inputs"
+
+#    - site_data: metadata about sampling sites
+site_data <- read.csv(paste0(sharepoint_path, "drop_field.csv"))
+# 2. Import Excel tracking sheet
+drop_sample_tracking <- read_excel(paste0(sharepoint_path, "drop_sample_tracking.xlsx"))
+#    - Convert 'grinding_inventory.duplicate' column to logical (TRUE/FALSE)
+drop_sample_tracking$grinding_inventory.duplicate <- as.logical(drop_sample_tracking$grinding_inventory.duplicate)
+#    - Replace NA values in 'duplicate' column with FALSE
+drop_sample_tracking$grinding_inventory.duplicate[is.na(drop_sample_tracking$grinding_inventory.duplicate)] <- FALSE
+
+# 3. Subset and calculate biomass
+#    - Select only columns of interest
+pardata_cols <- c(
+  "site_date_key", "drop_processing.species_code", "drop_processing.sample_trip",
+  "drop_processing.count", "drop_processing.tin_key", "grinding_inventory.vial_code",
+  "composite_vials.composite_vial", "final_vial", "grinding_inventory.box_code",
+  "grinding_inventory.box_position", "grinding_inventory.duplicate",
+  "drop_processing.tin_preweight", "tin_weights.tin_weight"
+)
+#    - Filter out rows missing species_code, then compute biomass = post-weight – pre-weight
+pared_data <- drop_sample_tracking[, pardata_cols] %>%
+  filter(!is.na(drop_processing.species_code)) %>%
+  mutate(biomass = tin_weights.tin_weight - drop_processing.tin_preweight)
+
+# 4. Rename columns to concise names for downstream use
+names(pared_data) <- c(
+  "site_date_key", "species_code", "sample_trip", "count", "tin_key",
+  "grind_vial", "composite_vial", "final_vial", "box_code", "box_position",
+  "duplicate", "tin_preweight", "tin_weight", "biomass"
+)
+
+```
+
+
+```{r import already processed}
+# ------------------------------------------------
+# IDENTIFY SAMPLES ALREADY PROCESSED IN WRAPPING
+# ------------------------------------------------
+
+# 1. Extract key columns where wrapping has been recorded
+site_species_processed <- drop_sample_tracking[, c(
+  "site_date_key", "sample_trip", "drop_processing.species_code",
+  "drop_processing.tin_key", "final_vial",
+  "wrapping_inventory.tray_code", "wrapping_inventory.tray_position",
+  "tray_inventory.Analysis Type", "tray_inventory.Status"
+)] %>%
+  # Remove entries without a tray code (i.e., not wrapped)
+  drop_na(wrapping_inventory.tray_code) %>%
+  # Create a duplicate 'species_code' column for consistency
+  mutate(species_code = drop_processing.species_code) %>%
+  # Keep only unique combinations of final_vial + tray code + tray position
+  distinct(final_vial, wrapping_inventory.tray_code, wrapping_inventory.tray_position, .keep_all = TRUE) %>%
+  # Exclude any records flagged as "Archived"
+  filter(tray_inventory.Status != "Archived")
+
+# 2. Check completeness of analysis: count how many wrapped samples per species per analysis type
+complete_analysis_check <- site_species_processed %>%
+  filter(!is.na(`tray_inventory.Analysis Type`)) %>%      # Drop rows missing analysis type
+  group_by(site_date_key, species_code, analysis_type = `tray_inventory.Analysis Type`) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = analysis_type,
+    values_from = n,
+    values_fill = 0
+  )
+
+# 3. Identify samples yet to be wrapped (“unwrapped_samples”):
+unwrapped_samples <- pared_data %>%
+  # Remove any samples that already appear in site_species_processed
+  anti_join(site_species_processed, by = c("site_date_key", "species_code")) %>%
+  # Exclude any flagged duplicates
+  subset(duplicate != TRUE) %>%
+  # Keep only one row per site/species combination
+  distinct(site_date_key, species_code, .keep_all = TRUE)
+
+# Print the unwrapped samples for quick review
+print(unwrapped_samples)
+
+
+```
+
+
+```{r Count samples from habitat quartiles}
+# ------------------------------------------------
+# COUNT SAMPLES PER SPECIES IN MANGROVE QUARTILES
+# ------------------------------------------------
+
+# 1. Define species-specific 'edge' and 'buffer' parameters in a lookup table
+species_params <- data.frame(
+  species = c("PENSETS", "PALSP", "CALSAP", "MINLON", "CTEBOL"),
+  edge    = c(1,       1,      1,       1,       1),
+  buf     = c(300,     300,    150,     50,      400)
+)
+
+# 2. Other variables: 
+trip      <- "2305"  # Sample trip identifier
+hab_folder <- c('satscale', 'satscale', 'satscale', "smallscale", "satscale")
+
+# Initialize an empty data.frame to accumulate results
+analyzed <- data.frame()
+
+# 3. Loop over each unique species in the processed data
+for (species_name in unique(site_species_processed$species_code)) {
+  # 3a. If species is in 'species_params', use its specific edge/buf, else default to (1, 200)
+  if (species_name %in% species_params$species) {
+    params   <- species_params[species_params$species == species_name, ]
+    edge_val <- params$edge
+    buf_val  <- params$buf
+  } else {
+    edge_val <- 1
+    buf_val  <- 200
+  }
+
+  # 3b. Determine which habitat folder to use (satscale or smallscale)
+  hab_folder_idx       <- which(species_params$species == species_name)
+  hab_folder_selected  <- ifelse(length(hab_folder_idx) > 0, hab_folder[hab_folder_idx], "satscale")
+
+  # 3c. Construct the habitat filename (prefix differs by folder type)
+  habx <- if (hab_folder_selected == "satscale") {
+    paste0("google2022_edge", edge_val, "_buf", buf_val)
+  } else {
+    paste0("combined_2022_edge", edge_val, "_buf", buf_val)
+  }
+
+  # 3d. Read the habitat CSV for this species
+  hab <- read.csv(file.path(
+    "inputs",
+    hab_folder_selected,
+    paste0(habx, ".csv")
+  ))
+
+  # 3e. Join 'site_species_processed' to habitat data by 'site_date_key', then filter
+  result <- site_species_processed %>%
+    left_join(hab, by = "site_date_key") %>%
+    filter(species_code == species_name, sample_trip == trip)
+
+  # 3f. Combine into the 'analyzed' data.frame
+  analyzed <- rbind(analyzed, result)
+}
+
+# 4. Merge the combined data with site-level metadata (e.g., lat/lon)
+analyzed <- analyzed %>% merge(site_data, by = "site_date_key")
+
+# 5. Create mangrove quartile categories based on 'edge_l.mangrove' (0–0.25 = Q1, etc.)
+analyzed$mangrove_quartiles <- cut(
+  analyzed$edge_l.mangrove,
+  breaks = c(-Inf,  0.25,  0.5,  0.75, Inf),
+  labels = c("Q1", "Q2", "Q3", "Q4"),
+  right  = FALSE  # left-closed intervals
+)
+
+# 6. Build a complete grid of species × quartile combinations
+all_combinations <- expand.grid(
+  species_code      = species_params$species,
+  mangrove_quartiles = c("Q1", "Q2", "Q3", "Q4"),
+  stringsAsFactors  = FALSE
+)
+
+# 7. Count observed (already wrapped) samples per species/quartile
+observed_counts <- analyzed %>%
+  distinct(species_code, mangrove_quartiles, site_date_key) %>%
+  group_by(species_code, mangrove_quartiles) %>%
+  summarise(count = n(), .groups = "drop")
+
+# 8. Left-join to ensure zero counts for missing combinations, then reshape
+counts <- all_combinations %>%
+  left_join(observed_counts, by = c("species_code", "mangrove_quartiles")) %>%
+  mutate(count = replace_na(count, 0)) %>%
+  pivot_wider(
+    names_from  = mangrove_quartiles,
+    values_from = count
+  )
+
+# 9. Print the resulting counts table (counts of wrapped samples per species/quartile)
+print(counts)
+
+```
+
+```{r List of samples yet to be analyzed , setup, include=FALSE}
+# ------------------------------------------------
+# PREPARE DATAFRAME OF SAMPLES STILL TO BE WRAPPED
+# ------------------------------------------------
+
+# (Re-define species parameters for this chunk’s context)
+species_params <- data.frame(
+  species = c("PENSETS", "PALSP", "CALSAP", "MINLON", "CTEBOL"),
+  edge    = c(1, 1, 1, 1, 1),
+  buf     = c(300, 300, 150, 50, 400)
+)
+
+# Initialize empty data.frame for accumulating unwrapped sample metadata
+ytb_analyzed <- data.frame(
+  site_date_key      = character(),
+  species_code       = character(),
+  sample_trip        = integer(),
+  count              = integer(),
+  tin_key            = character(),
+  vial_code          = character(),
+  box_code           = character(),
+  box_position       = character(),
+  duplicate          = character(),
+  Mangrove           = numeric(),
+  Manmade            = numeric(),
+  Saltmarsh          = numeric(),
+  edge_man           = numeric(),
+  edge_mar           = numeric(),
+  edge_l.mangrove    = numeric(),
+  edge_l.marsh       = numeric(),
+  land_water_ratio   = numeric(),
+  mud                = numeric(),
+  fetch_distance     = numeric(),
+  site_type          = character(),
+  biomass            = numeric(),
+  mangrove_quartiles = factor(levels = c("Q1", "Q2", "Q3", "Q4")),
+  stringsAsFactors   = FALSE
+)
+
+# Loop over each species in 'pared_data' (i.e., unwrapped candidates)
+for (species_name in unique(pared_data$species_code)) {
+  # Assign edge/buffer based on lookup or default
+  if (species_name %in% species_params$species) {
+    params   <- species_params[species_params$species == species_name, ]
+    edge_val <- params$edge
+    buf_val  <- params$buf
+  } else {
+    edge_val <- 1
+    buf_val  <- 200
+  }
+
+  # Determine habitat folder (same logic as previous chunk)
+  hab_folder_idx      <- which(species_params$species == species_name)
+  hab_folder_selected <- ifelse(length(hab_folder_idx) > 0, hab_folder[hab_folder_idx], "satscale")
+
+  # Construct habitat filename
+  habx <- if (hab_folder_selected == "satscale") {
+    paste0("google2022_edge", edge_val, "_buf", buf_val)
+  } else {
+    paste0("combined_edge", edge_val, "_buf", buf_val)
+  }
+
+  # Load habitat CSV
+  hab <- read.csv(file.path(
+    "inputs",
+    hab_folder_selected,
+    paste0(habx, ".csv")
+  ))
+
+  # Filter unwrapped samples by species and join habitat fields
+  ytb_result <- unwrapped_samples %>%
+    left_join(
+      hab[, c("site_date_key", "edge_l.mangrove", "land_water_ratio", "site_type", "edge_mar", "edge_man")],
+      by = "site_date_key"
+    ) %>%
+    filter(species_code == species_name, sample_trip == trip)
+
+  # Compute quartile bins for 'edge_l.mangrove'
+  ytb_result$mangrove_quartiles <- cut(
+    ytb_result$edge_l.mangrove,
+    breaks = c(-Inf, 0.25, 0.5, 0.75, Inf),
+    labels = c("Q1", "Q2", "Q3", "Q4"),
+    right  = FALSE
+  )
+
+  # Accumulate into 'ytb_analyzed'
+  ytb_analyzed <- rbind(ytb_analyzed, ytb_result)
+}
+
+# Merge with site metadata (e.g., lat/lon)
+ytb_analyzed <- ytb_analyzed %>% merge(site_data, by = "site_date_key")
+
+# Quick check: list unique sites in ytb_analyzed
+ytb_analyzed %>% distinct(site_date_key)
+
+
+```
+
+```{r Get a table of the number of samples needed from each species in each quadrant }
+# ------------------------------------------------
+# CALCULATE HOW MANY ADDITIONAL SAMPLES ARE NEEDED
+# ------------------------------------------------
+
+library(dplyr)
+
+# 1. Ensure all species are represented, even if currently absent in 'counts'
+species <- c("PENSETS", "PALSP", "CALSAP", "MINLON", "CTEBOL")
+species_df <- data.frame(species_code = species)
+
+# 2. Merge the full species list with 'counts' (samples already wrapped)
+filtered_data <- merge(
+  species_df,
+  counts,
+  by = "species_code",
+  all.x = TRUE
+)
+
+# 3. Replace any NAs (species/quartile combinations with zero current wraps) with 0
+filtered_data[is.na(filtered_data)] <- 0
+
+# 4. Compute the number of additional samples needed:
+#    - We want 5 samples per species per quartile
+needed_samples <- filtered_data
+needed_samples[-1] <- pmax(5 - filtered_data[-1], 0)
+#    (pmax ensures no negative values; if already ≥5, needed = 0)
+
+# 5. Display the table of additional samples required
+print(needed_samples)
+
+```
+
+```{r select the samples}
+# ------------------------------------------------
+# SELECT SPECIFIC SAMPLES TO WRAP USING SPATIAL CLUSTERING
+# ------------------------------------------------
+
+library(raster)
+
+# 1. Initialize output data.frames
+selected_samples       <- data.frame()
+excluded_combinations  <- data.frame()
+
+# 2. Load and reproject the base raster (PtFou2020crop)
+crop20    <- raster("inputs/PtFou2020crop.tif")
+utm_crs   <- CRS("+proj=utm +zone=15 +datum=WGS84 +units=m +no_defs")
+crop20_utm <- projectRaster(crop20, crs = utm_crs)
+
+# 3. Loop over each species × mangrove quartile combination
+for (species in needed_samples$species_code) {
+  for (mangrove_quantile in c("Q1", "Q2", "Q3", "Q4")) {
+    # 3a. How many more samples are needed?
+    needed <- needed_samples[needed_samples$species_code == species, mangrove_quantile]
+    message("Processing ", species, " ", mangrove_quantile, " (needed = ", needed, ")")
+
+    if (needed > 0) {
+      # 3b. Filter 'ytb_analyzed' to get candidate vials of the correct species/quartile
+      available_samples <- ytb_analyzed %>%
+        filter(
+          species_code == species,
+          mangrove_quartiles == mangrove_quantile
+        ) %>%
+        drop_na(grind_vial, biomass) %>%
+        subset(biomass > 0.02)  # Exclude very low-biomass samples
+
+      # 3c. Convert to sf and reproject for clustering
+      available_samples_sf <- st_as_sf(
+        available_samples,
+        coords = c("lon", "lat"),
+        crs    = 4326
+      )
+      analyzed_sf <- st_as_sf(
+        analyzed %>% filter(species_code == species, mangrove_quartiles == mangrove_quantile),
+        coords = c("lon", "lat"),
+        crs    = 4326
+      )
+
+      available_samples_utm <- st_transform(available_samples_sf, crs = 32615)
+      analyzed_utm          <- st_transform(analyzed_sf,          crs = 32615)
+
+      # 3d. If fewer available samples than needed, take them all
+      if (nrow(available_samples_utm) <= needed) {
+        message("Need ", needed, " but only ", nrow(available_samples_utm), " available; taking all")
+        temp <- available_samples_utm %>%
+          mutate(cluster = NA) %>%
+          select(site_date_key, species_code, final_vial) %>%
+          st_drop_geometry()
+        selected_samples <- bind_rows(selected_samples, temp)
+        excluded_combinations <- bind_rows(
+          excluded_combinations,
+          temp[, c("site_date_key", "species_code")]
+        )
+      } else {
+        # 3e. Merge available and already-analyzed points for clustering
+        merged_data <- bind_rows(
+          available_samples_utm %>% mutate(data_type = "available"),
+          analyzed_utm          %>% mutate(data_type = "analyzed")
+        )
+        # 3f. Extract XY coordinates and run k-means with 5 clusters
+        set.seed(789)
+        coordinates  <- st_coordinates(merged_data)
+        n_clusters   <- 5
+        kmeans_res   <- kmeans(coordinates, centers = n_clusters, nstart = 5, iter.max = 30)
+        merged_data  <- merged_data %>% mutate(cluster = kmeans_res$cluster)
+
+        # 3g. Plot clusters against the base raster for visual QA
+        #    - Assign distinct colors to each cluster
+        num_clusters  <- length(unique(merged_data$cluster))
+        colors        <- rainbow(num_clusters)
+        cluster_colors <- colors[as.numeric(as.factor(merged_data$cluster))]
+        merged_data_utm <- st_transform(merged_data, crs = 32615)
+        #    - Define point shapes: available = filled circle (21), analyzed = filled square (22)
+        custom_pch   <- c("available" = 21, "analyzed" = 22)
+        pch_values   <- custom_pch[merged_data$data_type]
+
+        plot(crop20_utm)
+        plot(
+          st_geometry(merged_data_utm),
+          col = "black",
+          bg  = cluster_colors,
+          pch = pch_values,
+          cex = 1,
+          add = TRUE
+        )
+        legend(
+          "topright",
+          legend = c("available", "analyzed"),
+          pch    = c(21, 22),
+          title  = paste(species, mangrove_quantile, "needed:", needed),
+          bty    = "n"
+        )
+        legend(
+          "bottomleft",
+          legend = sort(unique(merged_data$cluster)),
+          col    = colors,
+          pch    = 16,
+          title  = "Clusters",
+          bty    = "n"
+        )
+
+        # 3h. Exclude clusters that already contain analyzed samples
+        analyzed_clusters <- merged_data %>%
+          filter(data_type == "analyzed") %>%
+          pull(cluster) %>%
+          unique()
+        available_samples_utm <- merged_data %>%
+          filter(data_type == "available" & !cluster %in% analyzed_clusters)
+
+        # 3i. Determine clusters that contain “priority” vials (from 'old_table_species')
+        old_table_species <- old_table %>% filter(drop_processing.species_code == species)
+        priority_clusters <- available_samples_utm %>%
+          filter(site_date_key %in% old_table_species$site_date_key) %>%
+          pull(cluster) %>%
+          unique()
+        remaining_clusters <- setdiff(unique(available_samples_utm$cluster), priority_clusters)
+
+        # 3j. Select clusters, choosing priority clusters first
+        if (length(priority_clusters) >= needed) {
+          selected_clusters <- sample(priority_clusters, size = needed)
+        } else {
+          additional_clusters <- sample(remaining_clusters, size = needed - length(priority_clusters))
+          selected_clusters <- c(priority_clusters, additional_clusters)
+        }
+
+        # 3k. Within each selected cluster, pick one vial (prefer priority)
+        available_samples_utm <- available_samples_utm %>%
+          mutate(priority = site_date_key %in% old_table_species$site_date_key)
+        selected <- available_samples_utm %>%
+          filter(cluster %in% selected_clusters) %>%
+          group_by(cluster) %>%
+          slice_max(order_by = priority, with_ties = TRUE) %>%
+          slice_sample(n = 1) %>%
+          ungroup() %>%
+          st_drop_geometry() %>%
+          select(site_date_key, species_code, final_vial)
+
+        # 3l. Append to 'selected_samples' and 'excluded_combinations'
+        selected_samples <- rbind(selected_samples, selected)
+        excluded_combinations <- rbind(
+          excluded_combinations,
+          selected[, c("site_date_key", "species_code")]
+        )
+      }
+    }
+  }
+}
+
+# NOTE: A cluster overlap issue was noted for CALSAP Q1 during troubleshooting
+
+```
+
+```{r merge with related vials and print, echo=FALSE}
+# ------------------------------------------------
+# FOR EACH SELECTED SAMPLE, ADD ALL RELATED VIAL RECORDS
+# ------------------------------------------------
+
+# Extract only the pairing columns from selected_samples for join
+simple_select <- selected_samples[, c("site_date_key", "species_code")] %>% st_drop_geometry()
+
+# Find all drop_sample_tracking rows matching the selected site/species combos
+related_vials <- drop_sample_tracking %>%
+  semi_join(
+    simple_select,
+    by = c("site_date_key" = "site_date_key", "drop_processing.species_code" = "species_code")
+  ) %>%
+  # Exclude any flagged duplicates
+  filter(grinding_inventory.duplicate == FALSE)
+
+
+
+```
+
+
+```{r}
+# ----------------------------------------
+# BUILD FINAL WRAPPING TABLE AND EXPORT
+# ----------------------------------------
+
+library(janitor)
+
+# 1. Identify only unique site/species combos that still need wrapping
+need_to_wrap <- related_vials %>%
+  select(site_date_key, drop_processing.species_code) %>%
+  distinct()
+
+# 2. Join back to drop_sample_tracking to gather box/position/vial details
+wrapping_table_v2 <- need_to_wrap %>%
+  left_join(
+    drop_sample_tracking[, c(
+      "site_date_key", "drop_processing.species_code",
+      "grinding_inventory.box_code", "grinding_inventory.box_position",
+      "final_vial", "grinding_inventory.duplicate"
+    )],
+    by = c("site_date_key", "drop_processing.species_code")
+  ) %>%
+  # Exclude any duplicates
+  filter(grinding_inventory.duplicate == FALSE) %>%
+  arrange(drop_processing.species_code, site_date_key)
+
+# 3. Export the final wrapping instruction file to CSV 
+write.csv(
+  wrapping_table_v2,
+  "wrapping_table_250515.csv",
+  row.names = FALSE
+)
+
+
+
+```
+
+```{r check , echo=FALSE}
+# ----------------------------------------
+# QUALITY CHECK: VERIFY FINAL COUNTS AFTER WRAPPING PLAN
+# ----------------------------------------
+
+# 1. Combine samples that will no longer be wrapped (slim_old minus need_to_remove) with need_to_wrap
+#    - 'slim_old' and 'need_to_remove' presumably defined in prior context
+df_future <- slim_old %>%
+  anti_join(need_to_remove, by = c("site_date_key", "drop_processing.species_code")) %>%
+  bind_rows(need_to_wrap) %>%
+  left_join(
+    ytb_analyzed[, c("site_date_key", "mangrove_quartiles", "species_code")],
+    by = c("site_date_key", "drop_processing.species_code" = "species_code")
+  )
+
+# 2. Recount samples per species/quartile after plan is applied
+site_species_check <- df_future %>%
+  group_by(drop_processing.species_code, mangrove_quartiles) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  pivot_wider(
+    names_from  = mangrove_quartiles,
+    values_from = count,
+    values_fill = 0
+  )
+
+# 3. Combine with 'filtered_data' to confirm each species/quartile totals to 5
+combined_data <- full_join(
+  site_species_check,
+  filtered_data,
+  by      = c("drop_processing.species_code" = "species_code"),
+  suffix  = c(".check", ".filtered")
+)
+
+should_be_5s <- combined_data %>%
+  mutate(
+    Q1 = coalesce(Q1.check,  0) + coalesce(Q1.filtered,  0),
+    Q2 = coalesce(Q2.check,  0) + coalesce(Q2.filtered,  0),
+    Q3 = coalesce(Q3.check,  0) + coalesce(Q3.filtered,  0),
+    Q4 = coalesce(Q4.check,  0) + coalesce(Q4.filtered,  0)
+  ) %>%
+  select(drop_processing.species_code, Q1, Q2, Q3, Q4)
+
+# 4. Print the combined totals (each should equal 5)
+print(should_be_5s)
+
+# 5. (Optional) Cross-check wrapping_inventory to ensure no conflicts
+wrapping_inventory %>%
+  head()   # Preview first few rows
+```
+
+```{r composite_vials}
+# ----------------------------------------
+# CALCULATE COMPOSITE CONTRIBUTIONS FOR CHOSEN VIALS
+# ----------------------------------------
+
+# 1. Read back the wrapping_table we exported
+wrapping_table <- read.csv("wrapping_table_250515.csv")
+
+# 2. Join with drop_sample_tracking to get pre/post tin weights and filter duplicates
+composite_start <- wrapping_table %>%
+  left_join(
+    drop_sample_tracking[, c(
+      "drop_processing.species_code",
+      "grinding_inventory.vial_code", "final_vial",
+      "drop_processing.tin_preweight", "tin_weights.tin_weight",
+      "grinding_inventory.duplicate"
+    )],
+    by = c("vial" = "final_vial")
+  ) %>%
+  filter(grinding_inventory.duplicate == FALSE) %>%
+  arrange(drop_processing.species_code, site_date_key) %>%
+  unique()
+
+# 3. Compute biomass per vial and sum to site×species mass, then calculate percent contribution
+composite_prep <- composite_start %>%
+  mutate(biomass = tin_weights.tin_weight - drop_processing.tin_preweight) %>%
+  group_by(site_date_key, drop_processing.species_code) %>%
+  mutate(site_species_mass = sum(biomass)) %>%
+  ungroup() %>%
+  mutate(contribution_perc = biomass / site_species_mass) %>%
+  select(
+    site_date_key,
+    drop_processing.species_code,
+    grinding_inventory.vial_code,
+    biomass,
+    site_species_mass,
+    contribution_perc
+  )
+
+# 4. Export composite preparation table to CSV
+write.csv(
+  composite_prep,
+"composite_prep_250515.csv",
+  row.names = FALSE
+)
+
+```
+
